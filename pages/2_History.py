@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from streamlit_app.components.feature_store_io import read_feature_group
+from components.feature_store_io import read_feature_group
 
 # ---------------------------------------------------------------------
 # Load local secrets (.env). Safe in Streamlit Cloud (ignored if missing)

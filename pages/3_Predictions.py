@@ -3,9 +3,9 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from streamlit_app.components.io import read_parquet_s3
-from streamlit_app.components.theme import theme_toggle_sidebar, apply_theme_css, plotly_template
-from streamlit_app.components.sections import Section, render_blog
+from components.io import read_parquet_s3
+from components.theme import theme_toggle_sidebar, apply_theme_css, plotly_template
+from components.sections import Section, render_blog
 
 st.set_page_config(page_title="Predictions", page_icon="🔮", layout="wide")
 
