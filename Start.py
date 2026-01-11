@@ -15,7 +15,7 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False
 # ---------------------------------------------------------------------
 # Config (EDIT THESE ONCE)
 # ---------------------------------------------------------------------
-ELECTRICITY_FG_NAME = "electricity"
+ELECTRICITY_FG_NAME = "electricity_hourly"
 ELECTRICITY_FG_VERSION = 1
 
 TS_COL = "date"          # <-- change if needed
@@ -32,7 +32,7 @@ st.set_page_config(
 )
 
 # Sidebar title
-st.sidebar.title("Electricity Dashboard")
+st.sidebar.title("")
 
 # ---------------------------------------------------------------------
 # Load data
@@ -74,22 +74,32 @@ has_pred = PRED_COL in df.columns
 st.title("⚡ Electricity Price Forecasting")
 st.markdown(
     """
-This dashboard shows:
-- **Historical electricity prices**
-- **Model forecasts** produced from weather + market features (Hopsworks Feature Store)
+This dashboard presents the results of a serverless machine learning project developed by **Atle Johansson** and
+**Robert Bromans** as part of the course **ID2223 – Scalable Machine Learning and Deep Learning** at **KTH Royal Institute of Technology**.
 
-Use the pages in the sidebar to explore the full history, weather features, and detailed diagnostics.
+The project demonstrates an end-to-end, production-oriented machine learning pipeline built on a modern cloud-based
+architecture. **Hopsworks** is used as the backend feature store and model infrastructure, while **Streamlit** serves
+as the interactive frontend for data exploration, visualization, and result presentation.
+
+Historical electricity price data is combined with weather information from multiple regions and cities across Sweden.
+These datasets are stored and managed in the Hopsworks Feature Store and used to train an **XGBoost regression model**
+designed to capture temporal patterns and weather-driven effects in electricity prices.
+
+Once trained, the model generates forecasts of future electricity prices, which are visualized alongside historical
+observations in this dashboard. The application allows users to explore recent price trends, compare predictions to
+actual values, and gain insight into the data and features used by the model.
+
+Use the pages in the sidebar to explore historical data, weather features, and detailed diagnostics behind the
+electricity price forecasts.
 """
 )
 
-st.markdown("---")
+st.subheader("📈 Electricity price vs prediction (last 1000 points)")
+st.markdown(
+    "The chart below shows the result of this project, visit the other pages for more granular data and explanations."
+    
+)
 
-# ---------------------------------------------------------------------
-# Simple chart: price vs prediction
-# ---------------------------------------------------------------------
-st.subheader("📈 Electricity price vs prediction (recent window)")
-
-# Show last N points on landing for clarity
 N = 1000
 df_plot = df.tail(N).copy()
 
@@ -123,10 +133,3 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------------------------------------------------
-# Small table
-# ---------------------------------------------------------------------
-st.subheader("📋 Latest rows")
-cols_to_show = [TS_COL, PRICE_COL] + ([PRED_COL] if has_pred else [])
-st.dataframe(df[cols_to_show].tail(30), use_container_width=True)
