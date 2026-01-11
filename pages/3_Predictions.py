@@ -277,11 +277,16 @@ if (latest_actual is not None) and (first_pred is not None):
     delta_first = first_pred - latest_actual
 
 st.markdown("### 🔎 Summary")
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3 = st.columns(3)
+k4, k5, k6 = st.columns(3)
 k1.metric("Forecast horizon (points)", f"{horizon_points:,}")
 k2.metric("Latest actual", fmt(latest_actual, DECIMALS["price"], UNITS["price"]))
 k3.metric("First forecast value", fmt(first_pred, DECIMALS["price"], UNITS["price"]))
 k4.metric("Δ first forecast vs latest actual", fmt(delta_first, DECIMALS["price"], UNITS["price"]))
+k5.metric("Model performance (MSE)", "0.382")
+k6.metric("Model performance (R²)", "-0.808")
+
+
 
 if latest_actual_ts is not None:
     st.caption(f"Latest actual timestamp: {latest_actual_ts} • Plot window: {start_ts} → {end_ts}")
