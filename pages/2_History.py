@@ -24,11 +24,11 @@ WEATHER_FG_NAME = "weather"
 WEATHER_FG_VERSION = 1
 
 # Electricity schema
-TS_COL = "date"          # <-- change if needed
+TS_COL = "date"            # <-- change if needed
 PRICE_COL = "sek_per_kwh"  # <-- change if needed
 
 # Weather schema (NEW: city-specific columns)
-WEATHER_TS_COL = "date"  # <-- change if your weather time column isn't "date"
+WEATHER_TS_COL = "date"    # <-- change if your weather time column isn't "date"
 
 # City toggle options (must match your column suffixes)
 CITY_OPTIONS = {
@@ -66,6 +66,11 @@ DECIMALS = {
     "precip": 2,
     "cloud": 1,
 }
+
+# ---------------------------------------------------------------------
+# Plot styling
+# ---------------------------------------------------------------------
+LINE_WIDTH = 3  # All chart lines solid, width 3
 
 def fmt(x, decimals: int = 2, unit: str | None = None, na: str = "—") -> str:
     """Safe number formatter with optional unit suffix."""
@@ -265,7 +270,22 @@ else:
     start_ts = start_for_timeframe(timeframe)
     end_ts = max_ts
 
-df_el_plot = df_el[(df_el[TS_COL] >= start_ts) & (df_el[TS_COL] <= end_ts)].copy()
+# ---------------------------------------------------------------------
+# IMPORTANT FIX:
+# Compute moving averages on the FULL dataset FIRST (so they exist immediately
+# when you zoom into a timeframe), using min_periods=1.
+# Then filter for plotting.
+# ---------------------------------------------------------------------
+df_el_full = df_el.copy()
+
+if show_ma_30:
+    df_el_full["ma_30d"] = df_el_full[PRICE_COL].rolling(window=30, min_periods=1).mean()
+if show_ma_182:
+    df_el_full["ma_182d"] = df_el_full[PRICE_COL].rolling(window=182, min_periods=1).mean()
+if show_ma_365:
+    df_el_full["ma_365d"] = df_el_full[PRICE_COL].rolling(window=365, min_periods=1).mean()
+
+df_el_plot = df_el_full[(df_el_full[TS_COL] >= start_ts) & (df_el_full[TS_COL] <= end_ts)].copy()
 if df_el_plot.empty:
     st.warning("No electricity data in the selected timeframe.")
     st.stop()
@@ -283,40 +303,40 @@ fig_el.add_trace(
         y=df_el_plot[PRICE_COL],
         mode="lines",
         name=f"Price ({UNITS['price']})",
+        line=dict(width=LINE_WIDTH, dash="solid"),
     )
 )
 
-if show_ma_30:
-    df_el_plot["ma_30d"] = df_el_plot[PRICE_COL].rolling(30).mean()
+if show_ma_30 and "ma_30d" in df_el_plot.columns:
     fig_el.add_trace(
         go.Scatter(
             x=df_el_plot[TS_COL],
             y=df_el_plot["ma_30d"],
             mode="lines",
             name=f"30d avg ({UNITS['price']})",
-            line=dict(dash="dash"),
+            line=dict(width=LINE_WIDTH, dash="solid"),
         )
     )
-if show_ma_182:
-    df_el_plot["ma_182d"] = df_el_plot[PRICE_COL].rolling(182).mean()
+
+if show_ma_182 and "ma_182d" in df_el_plot.columns:
     fig_el.add_trace(
         go.Scatter(
             x=df_el_plot[TS_COL],
             y=df_el_plot["ma_182d"],
             mode="lines",
             name=f"6m avg ({UNITS['price']})",
-            line=dict(dash="dot"),
+            line=dict(width=LINE_WIDTH, dash="solid"),
         )
     )
-if show_ma_365:
-    df_el_plot["ma_365d"] = df_el_plot[PRICE_COL].rolling(365).mean()
+
+if show_ma_365 and "ma_365d" in df_el_plot.columns:
     fig_el.add_trace(
         go.Scatter(
             x=df_el_plot[TS_COL],
             y=df_el_plot["ma_365d"],
             mode="lines",
             name=f"12m avg ({UNITS['price']})",
-            line=dict(dash="dashdot"),
+            line=dict(width=LINE_WIDTH, dash="solid"),
         )
     )
 
@@ -429,6 +449,7 @@ fig_temp.add_trace(
         y=df_w_plot[temp_col],
         mode="lines",
         name=f"Temperature (2m) ({UNITS['temp']})",
+        line=dict(width=LINE_WIDTH, dash="solid"),
     )
 )
 fig_temp.update_layout(
@@ -451,6 +472,7 @@ fig_wind.add_trace(
         y=df_w_plot[wind_col],
         mode="lines",
         name=f"Wind speed (10m) ({UNITS['wind']})",
+        line=dict(width=LINE_WIDTH, dash="solid"),
     )
 )
 fig_wind.update_layout(

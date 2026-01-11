@@ -9,18 +9,34 @@ import plotly.graph_objects as go
 
 from components.feature_store_io import read_feature_group
 
+# ---------------------------------------------------------------------
 # Load local secrets (.env). Safe in Streamlit Cloud (ignored if missing)
+# ---------------------------------------------------------------------
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 # ---------------------------------------------------------------------
-# Config (EDIT THESE ONCE)
+# Feature groups
 # ---------------------------------------------------------------------
 ELECTRICITY_FG_NAME = "electricity_hourly"
 ELECTRICITY_FG_VERSION = 1
 
-TS_COL = "date"          # <-- change if needed
-PRICE_COL = "sek_per_kwh"          # <-- change if needed
-PRED_COL = "sek_per_kwh" # <-- change if your prediction column is named differently
+PREDICTIONS_FG_NAME = "price_predictions"
+PREDICTIONS_FG_VERSION = 1  # change if needed
+
+# ---------------------------------------------------------------------
+# Schema (edit if needed)
+# ---------------------------------------------------------------------
+TS_COL = "date"
+PRICE_COL = "sek_per_kwh"
+PRED_COL = "predicted_sek_per_kwh"
+
+# ---------------------------------------------------------------------
+# Display config
+# ---------------------------------------------------------------------
+UNITS = {"price": "SEK/kWh"}
+
+def axis_title(name: str, unit: str | None = None) -> str:
+    return f"{name} ({unit})" if unit else name
 
 # ---------------------------------------------------------------------
 # Streamlit config
@@ -31,7 +47,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Sidebar title
 st.sidebar.title("")
 
 # ---------------------------------------------------------------------
@@ -39,97 +54,132 @@ st.sidebar.title("")
 # ---------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_electricity() -> pd.DataFrame:
-    return read_feature_group(name=ELECTRICITY_FG_NAME, version=ELECTRICITY_FG_VERSION)
+    return read_feature_group(
+        name=ELECTRICITY_FG_NAME,
+        version=ELECTRICITY_FG_VERSION,
+    )
+
+@st.cache_data(ttl=300)
+def load_predictions() -> pd.DataFrame:
+    return read_feature_group(
+        name=PREDICTIONS_FG_NAME,
+        version=PREDICTIONS_FG_VERSION,
+    )
 
 try:
-    df = load_electricity()
+    df_hist = load_electricity()
 except Exception as e:
-    st.error("Failed to load the electricity feature group from Hopsworks.")
+    st.error("Failed to load electricity feature group from Hopsworks.")
     st.exception(e)
     st.stop()
 
-# Validate schema
-missing = []
-for col in [TS_COL, PRICE_COL]:
-    if col not in df.columns:
-        missing.append(col)
-
-if missing:
-    st.error(f"Missing required columns in `{ELECTRICITY_FG_NAME}`: {missing}")
-    with st.expander("Developer: available columns"):
-        st.write(list(df.columns))
+try:
+    df_pred = load_predictions()
+except Exception as e:
+    st.error("Failed to load price_predictions feature group from Hopsworks.")
+    st.exception(e)
     st.stop()
 
-# Parse + sort
-df = df.copy()
-df[TS_COL] = pd.to_datetime(df[TS_COL], utc=True, errors="coerce")
-df = df.dropna(subset=[TS_COL]).sort_values(TS_COL)
+# ---------------------------------------------------------------------
+# Validate schemas
+# ---------------------------------------------------------------------
+missing_hist = [c for c in [TS_COL, PRICE_COL] if c not in df_hist.columns]
+if missing_hist:
+    st.error(f"Missing required columns in `{ELECTRICITY_FG_NAME}`: {missing_hist}")
+    with st.expander("Developer: electricity_hourly columns"):
+        st.write(list(df_hist.columns))
+    st.stop()
 
-# Optional: if predictions column doesn't exist, still show history
-has_pred = PRED_COL in df.columns
+missing_pred = [c for c in [TS_COL, PRED_COL] if c not in df_pred.columns]
+if missing_pred:
+    st.error(f"Missing required columns in `{PREDICTIONS_FG_NAME}`: {missing_pred}")
+    with st.expander("Developer: price_predictions columns"):
+        st.write(list(df_pred.columns))
+    st.stop()
 
 # ---------------------------------------------------------------------
-# Landing content
+# Parse + sort
+# ---------------------------------------------------------------------
+df_hist = df_hist.copy()
+df_hist[TS_COL] = pd.to_datetime(df_hist[TS_COL], utc=True, errors="coerce")
+df_hist = df_hist.dropna(subset=[TS_COL]).sort_values(TS_COL)
+df_hist[PRICE_COL] = pd.to_numeric(df_hist[PRICE_COL], errors="coerce")
+
+df_pred = df_pred.copy()
+df_pred[TS_COL] = pd.to_datetime(df_pred[TS_COL], utc=True, errors="coerce")
+df_pred = df_pred.dropna(subset=[TS_COL]).sort_values(TS_COL)
+df_pred[PRED_COL] = pd.to_numeric(df_pred[PRED_COL], errors="coerce")
+
+# ---------------------------------------------------------------------
+# Page header
 # ---------------------------------------------------------------------
 st.title("⚡ Electricity Price Forecasting")
 st.markdown(
     """
-This dashboard presents the results of a serverless machine learning project developed by **Atle Johansson** and
-**Robert Bromans** as part of the course **ID2223 – Scalable Machine Learning and Deep Learning** at **KTH Royal Institute of Technology**.
+This page shows the most recent historical electricity prices together with the latest
+model-generated forecasts. The historical data comes from the electricity feature group,
+while the forecast is produced by an XGBoost model and stored in the `price_predictions`
+feature group.
 
-The project demonstrates an end-to-end, production-oriented machine learning pipeline built on a modern cloud-based
-architecture. **Hopsworks** is used as the backend feature store and model infrastructure, while **Streamlit** serves
-as the interactive frontend for data exploration, visualization, and result presentation.
-
-Historical electricity price data is combined with weather information from multiple regions and cities across Sweden.
-These datasets are stored and managed in the Hopsworks Feature Store and used to train an **XGBoost regression model**
-designed to capture temporal patterns and weather-driven effects in electricity prices.
-
-Once trained, the model generates forecasts of future electricity prices, which are visualized alongside historical
-observations in this dashboard. The application allows users to explore recent price trends, compare predictions to
-actual values, and gain insight into the data and features used by the model.
-
-Use the pages in the sidebar to explore historical data, weather features, and detailed diagnostics behind the
-electricity price forecasts.
+The chart below displays the last 20 days of historical prices and the corresponding
+future price predictions.
 """
 )
 
-st.subheader("📈 Electricity price vs prediction (last 1000 points)")
-st.markdown(
-    "The chart below shows the result of this project, visit the other pages for more granular data and explanations."
-    
+# ---------------------------------------------------------------------
+# Plot window: last 20 days (hourly → 480 points)
+# ---------------------------------------------------------------------
+st.subheader("📈 Electricity price — history vs forecast")
+st.caption(f"Unit: {UNITS['price']} • Timestamps shown in UTC")
+
+N = 24 * 20  # 480 hours
+df_hist_plot = df_hist.tail(N).copy()
+if df_hist_plot.empty:
+    st.warning("No historical electricity data available.")
+    st.stop()
+
+# Extend x-axis to include future predictions
+x_start = df_hist_plot[TS_COL].min()
+x_end = max(df_hist_plot[TS_COL].max(), df_pred[TS_COL].max())
+
+# ---------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------
+fig = go.Figure()
+
+# Historical prices (BLUE)
+fig.add_trace(
+    go.Scatter(
+        x=df_hist_plot[TS_COL],
+        y=df_hist_plot[PRICE_COL],
+        mode="lines",
+        name="Actual price",
+        line=dict(color="#1f77b4", width=3),  # blue
+    )
 )
 
-N = 1000
-df_plot = df.tail(N).copy()
-
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=df_plot[TS_COL],
-    y=df_plot[PRICE_COL],
-    mode="lines",
-    name="Actual price",
-))
-
-if has_pred:
-    # ensure numeric-ish
-    df_plot[PRED_COL] = pd.to_numeric(df_plot[PRED_COL], errors="coerce")
-    fig.add_trace(go.Scatter(
-        x=df_plot[TS_COL],
-        y=df_plot[PRED_COL],
-        mode="lines",
-        name="Prediction",
-        line=dict(dash="dash"),
-    ))
+# Forecast prices (GREEN)
+if not df_pred.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=df_pred[TS_COL],
+            y=df_pred[PRED_COL],
+            mode="lines",
+            name="Forecast",
+            line=dict(color="#2ca02c", width=3),  # green
+        )
+    )
 else:
-    st.info(f"No prediction column `{PRED_COL}` found in `{ELECTRICITY_FG_NAME}`. Showing only actual prices.")
+    st.info("No forecast data available to plot.")
 
 fig.update_layout(
     template="plotly_dark",
     height=520,
     margin=dict(l=20, r=20, t=40, b=20),
     xaxis_title="Time (UTC)",
-    yaxis_title="Price",
+    yaxis_title=axis_title("Price", UNITS["price"]),
 )
+
+fig.update_xaxes(range=[x_start, x_end])
 
 st.plotly_chart(fig, use_container_width=True)

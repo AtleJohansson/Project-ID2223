@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
-
 from dotenv import load_dotenv
+
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from components.io import read_parquet_s3
+from components.feature_store_io import read_feature_group
 
 # ---------------------------------------------------------------------
 # Load local secrets (.env). Safe in Streamlit Cloud (ignored if missing)
@@ -16,22 +15,96 @@ from components.io import read_parquet_s3
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 # ---------------------------------------------------------------------
+# Feature Store config (EDIT THESE IF NEEDED)
+# ---------------------------------------------------------------------
+# Historical electricity (same as your other page)
+ELECTRICITY_FG_NAME = "electricity_hourly"
+ELECTRICITY_FG_VERSION = 1
+HIST_TS_COL = "date"            # time column in electricity FG
+HIST_PRICE_COL = "sek_per_kwh"  # price column in electricity FG
+
+# Forecast feature group (EDIT to match your Hopsworks FG)
+# This FG should contain predicted values over future timestamps.
+FORECAST_FG_NAME = "price_predictions"  # <-- CHANGE if your FG is named differently
+FORECAST_FG_VERSION = 1
+PRED_TS_COL = "date"                   # <-- change if needed
+PRED_COL = "predicted_sek_per_kwh"     # <-- change if needed
+LOW_COL = "yhat_lower"                 # optional
+UP_COL = "yhat_upper"                  # optional
+
+# ---------------------------------------------------------------------
 # Display config (units + formatting)
 # ---------------------------------------------------------------------
-UNITS = {
-    "price": "SEK/kWh",
+UNITS = {"price": "SEK/kWh"}
+DECIMALS = {"price": 3}
+
+# Plot styling
+LINE_WIDTH = 3  # all lines solid, width 3
+
+# ---------------------------------------------------------------------
+# Fixed colors (so traces don’t change when toggling moving averages)
+# NOTE: You can change these to whatever palette you like.
+# ---------------------------------------------------------------------
+TRACE_COLORS = {
+    "historical": "#1f77b4",  # blue
+    "ma_30d": "#ff7f0e",      # orange
+    "ma_182d": "#2ca02c",     # green
+    "ma_365d": "#9467bd",     # purple
+    "forecast": "#d62728",    # red
+    "band": "rgba(214,39,40,0.18)",  # translucent red fill
 }
 
-DECIMALS = {
-    "price": 3,
-}
+# ---------------------------------------------------------------------
+# Hard-coded feature importance (from your screenshot)
+# NOTE: If any feature name differs from your model, change the strings here.
+# ---------------------------------------------------------------------
+FI_FEATURES = [
+    "wind_speed_10m_malmo",
+    "temperature_2m_stockholm",
+    "temperature_2m_malmo",
+    "wind_speed_10m_orebro",
+    "temperature_2m_sundsvall",
+    "wind_speed_10m_stockholm",
+    "wind_speed_10m_sundsvall",
+    "wind_speed_10m_karlstad",
+    "temperature_2m_karlstad",
+    "temperature_2m_vasteras",
+    "temperature_2m_uppsala",
+    "temperature_2m_orebro",
+    "wind_speed_10m_uppsala",
+    "wind_speed_10m_vasteras",
+    "temperature_2m_stockholm_2",  # <-- rename if not correct
+    "temperature_2m_sundsvall_2",  # <-- rename if not correct
+    "cloud_cover_malmo",
+    "cloud_cover_karlstad",
+    "cloud_cover_orebro",
+    "cloud_cover_uppsala",
+    "cloud_cover_vasteras",
+    "precipitation_stockholm",
+    "precipitation_vasteras",
+    "precipitation_uppsala",
+    "precipitation_karlstad",
+    "precipitation_sundsvall",
+    "precipitation_malmo",
+    "precipitation_orebro",
+]
+FI_IMPORTANCES = [
+    464.0, 433.0, 427.0, 339.0, 321.0, 314.0, 299.0, 290.0, 285.0, 262.0, 255.0, 208.0,
+    199.0, 185.0, 185.0, 158.0, 146.0, 140.0, 136.0, 134.0, 110.0, 52.0, 46.0, 45.0,
+    44.0, 43.0, 41.0, 39.0,
+]
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def fmt(x, decimals: int = 2, unit: str | None = None, na: str = "—") -> str:
     try:
         if x is None:
             return na
         if isinstance(x, float) and pd.isna(x):
             return na
+        if isinstance(x, (pd.Timestamp,)):
+            return str(x)
         v = float(x)
         s = f"{v:,.{decimals}f}"
         return f"{s} {unit}" if unit else s
@@ -41,6 +114,9 @@ def fmt(x, decimals: int = 2, unit: str | None = None, na: str = "—") -> str:
 def axis_title(name: str, unit: str | None = None) -> str:
     return f"{name} ({unit})" if unit else name
 
+def to_numeric_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
 # ---------------------------------------------------------------------
 # Streamlit config
 # ---------------------------------------------------------------------
@@ -49,189 +125,244 @@ st.set_page_config(page_title="Predictions", page_icon="🔮", layout="wide")
 st.title("🔮 Predictions")
 st.markdown(
     """
-This page shows the **latest daily electricity price forecast** generated by our **XGBoost model**.
-The model uses the most recent feature values (e.g., weather and market signals stored in the feature store)
-to produce a forward-looking prediction horizon. The chart compares the recent historical prices with the
-forecasted trajectory, and may optionally include uncertainty bands if available in the forecast output.
-
-All values are displayed with their corresponding units (**SEK/kWh**) and timestamps are shown in **UTC**.
-"""
+This page shows the **electricity price forecast** generated by the **XGBoost model**. Below is a short summary of the model performance."""
 )
-
 st.markdown("---")
 
 # ---------------------------------------------------------------------
-# S3 config
-# ---------------------------------------------------------------------
-bucket = os.environ.get("S3_BUCKET")
-if not bucket:
-    st.error("S3_BUCKET not set. Add it to your .env or Streamlit secrets.")
-    st.stop()
-
-prefix = os.environ.get("S3_PREFIX", "").strip("/")
-pred_key = f"{prefix}/forecast_latest.parquet" if prefix else "forecast_latest.parquet"
-history_key = f"{prefix}/history.parquet" if prefix else "history.parquet"
-
-# ---------------------------------------------------------------------
-# Load data
+# Load feature groups from Hopsworks
 # ---------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def load_pred() -> pd.DataFrame:
-    return read_parquet_s3(bucket, pred_key)
+def load_history() -> pd.DataFrame:
+    return read_feature_group(name=ELECTRICITY_FG_NAME, version=ELECTRICITY_FG_VERSION)
 
 @st.cache_data(ttl=300)
-def load_hist() -> pd.DataFrame:
-    return read_parquet_s3(bucket, history_key)
+def load_forecast() -> pd.DataFrame:
+    return read_feature_group(name=FORECAST_FG_NAME, version=FORECAST_FG_VERSION)
 
 try:
-    pred = load_pred()
-    hist = load_hist()
+    hist = load_history()
 except Exception as e:
-    st.error("Failed to load prediction/history parquet files from S3.")
+    st.error("Failed to load the electricity (history) feature group from Hopsworks.")
+    st.exception(e)
+    st.stop()
+
+try:
+    pred = load_forecast()
+except Exception as e:
+    st.error("Failed to load the forecast feature group from Hopsworks.")
     st.exception(e)
     st.stop()
 
 # ---------------------------------------------------------------------
-# Normalize schema
+# Validate schema
 # ---------------------------------------------------------------------
-TS_COL = "timestamp"
-HIST_PRICE_COL = "price"
-PRED_COL = "predicted_price"
-
-required_pred = [TS_COL, PRED_COL]
-missing_pred = [c for c in required_pred if c not in pred.columns]
-if missing_pred:
-    st.error(f"forecast_latest.parquet schema mismatch. Missing: {missing_pred}")
-    with st.expander("Developer: forecast_latest columns"):
-        st.write(list(pred.columns))
-    st.stop()
-
-required_hist = [TS_COL, HIST_PRICE_COL]
-missing_hist = [c for c in required_hist if c not in hist.columns]
+missing_hist = [c for c in [HIST_TS_COL, HIST_PRICE_COL] if c not in hist.columns]
 if missing_hist:
-    st.error(f"history.parquet schema mismatch. Missing: {missing_hist}")
-    with st.expander("Developer: history columns"):
+    st.error(f"Electricity FG schema mismatch. Missing columns: {missing_hist}")
+    with st.expander("Developer: electricity FG columns"):
         st.write(list(hist.columns))
     st.stop()
 
-pred = pred.copy()
+missing_pred = [c for c in [PRED_TS_COL, PRED_COL] if c not in pred.columns]
+if missing_pred:
+    st.error(f"Forecast FG schema mismatch. Missing columns: {missing_pred}")
+    with st.expander("Developer: forecast FG columns"):
+        st.write(list(pred.columns))
+    st.stop()
+
+# Normalize
 hist = hist.copy()
+pred = pred.copy()
 
-pred[TS_COL] = pd.to_datetime(pred[TS_COL], utc=True, errors="coerce")
-pred = pred.dropna(subset=[TS_COL]).sort_values(TS_COL)
-pred[PRED_COL] = pd.to_numeric(pred[PRED_COL], errors="coerce")
+hist[HIST_TS_COL] = pd.to_datetime(hist[HIST_TS_COL], utc=True, errors="coerce")
+hist = hist.dropna(subset=[HIST_TS_COL]).sort_values(HIST_TS_COL)
+hist[HIST_PRICE_COL] = to_numeric_series(hist[HIST_PRICE_COL])
 
-hist[TS_COL] = pd.to_datetime(hist[TS_COL], utc=True, errors="coerce")
-hist = hist.dropna(subset=[TS_COL]).sort_values(TS_COL)
-hist[HIST_PRICE_COL] = pd.to_numeric(hist[HIST_PRICE_COL], errors="coerce")
+pred[PRED_TS_COL] = pd.to_datetime(pred[PRED_TS_COL], utc=True, errors="coerce")
+pred = pred.dropna(subset=[PRED_TS_COL]).sort_values(PRED_TS_COL)
+pred[PRED_COL] = to_numeric_series(pred[PRED_COL])
 
-# Optional uncertainty columns
-LOW_COL = "yhat_lower"
-UP_COL = "yhat_upper"
 has_uncertainty = (LOW_COL in pred.columns) and (UP_COL in pred.columns)
 if has_uncertainty:
-    pred[LOW_COL] = pd.to_numeric(pred[LOW_COL], errors="coerce")
-    pred[UP_COL] = pd.to_numeric(pred[UP_COL], errors="coerce")
+    pred[LOW_COL] = to_numeric_series(pred[LOW_COL])
+    pred[UP_COL] = to_numeric_series(pred[UP_COL])
 
 # ---------------------------------------------------------------------
-# Sidebar controls (match other pages)
+# Sidebar controls: timeframe + moving averages + uncertainty
 # ---------------------------------------------------------------------
-st.sidebar.subheader("Forecast chart controls")
+st.sidebar.subheader("Chart controls")
 
-hist_window = st.sidebar.selectbox(
-    "Historical context window",
-    ["Last 7D", "Last 30D", "Last 90D", "Last 180D", "Last 365D", "All available"],
+timeframe = st.sidebar.selectbox(
+    "Timeframe",
+    ["Last 7D", "Last 15D", "Last 30D", "Last 90D", "Last 180D", "Last 365D", "YTD", "All", "Custom"],
     index=2,
 )
 
+show_mas = st.sidebar.checkbox("Show moving averages (history)", value=True)
+show_ma_30 = st.sidebar.checkbox("30d avg", value=True) if show_mas else False
+show_ma_182 = st.sidebar.checkbox("6m avg", value=False) if show_mas else False
+show_ma_365 = st.sidebar.checkbox("12m avg", value=False) if show_mas else False
+
 show_uncertainty = st.sidebar.checkbox("Show uncertainty band", value=True) if has_uncertainty else False
 
-# Determine historical subset
-hist_min_ts = hist[TS_COL].min()
-hist_max_ts = hist[TS_COL].max()
+hist_min_ts = hist[HIST_TS_COL].min()
+hist_max_ts = hist[HIST_TS_COL].max()
 
-def start_for_hist_window(sel: str) -> pd.Timestamp:
-    end = hist_max_ts
-    if sel == "Last 7D":
+plot_end = max(
+    [t for t in [hist_max_ts, pred[PRED_TS_COL].max()] if pd.notna(t)],
+    default=hist_max_ts,
+)
+
+def start_for_timeframe(tf: str) -> pd.Timestamp:
+    end = plot_end
+    if tf == "Last 7D":
         return end - pd.Timedelta(days=7)
-    if sel == "Last 30D":
+    if tf == "Last 15D":
+        return end - pd.Timedelta(days=15)
+    if tf == "Last 30D":
         return end - pd.Timedelta(days=30)
-    if sel == "Last 90D":
+    if tf == "Last 90D":
         return end - pd.Timedelta(days=90)
-    if sel == "Last 180D":
+    if tf == "Last 180D":
         return end - pd.Timedelta(days=180)
-    if sel == "Last 365D":
+    if tf == "Last 365D":
         return end - pd.Timedelta(days=365)
-    return hist_min_ts
+    if tf == "YTD":
+        return pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz)
+    if tf == "All":
+        return min(hist_min_ts, pred[PRED_TS_COL].min())
+    return min(hist_min_ts, pred[PRED_TS_COL].min())
 
-hist_start = start_for_hist_window(hist_window)
-hist_plot = hist[hist[TS_COL] >= hist_start].copy()
+if timeframe == "Custom":
+    min_all = min(hist_min_ts, pred[PRED_TS_COL].min())
+    max_all = plot_end
+    start_date, end_date = st.sidebar.date_input(
+        "Custom date range",
+        value=(min_all.date(), max_all.date()),
+        min_value=min_all.date(),
+        max_value=max_all.date(),
+    )
+    start_ts = pd.Timestamp(start_date, tz="UTC")
+    end_ts = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+else:
+    start_ts = start_for_timeframe(timeframe)
+    end_ts = plot_end
+
+# ---------------------------------------------------------------------
+# Compute moving averages on FULL history first (so they don’t “start late”)
+# ---------------------------------------------------------------------
+hist_full = hist.copy()
+if show_ma_30:
+    hist_full["ma_30d"] = hist_full[HIST_PRICE_COL].rolling(window=30, min_periods=1).mean()
+if show_ma_182:
+    hist_full["ma_182d"] = hist_full[HIST_PRICE_COL].rolling(window=182, min_periods=1).mean()
+if show_ma_365:
+    hist_full["ma_365d"] = hist_full[HIST_PRICE_COL].rolling(window=365, min_periods=1).mean()
+
+# Filter for plotting window
+hist_plot = hist_full[(hist_full[HIST_TS_COL] >= start_ts) & (hist_full[HIST_TS_COL] <= end_ts)].copy()
+pred_plot = pred[(pred[PRED_TS_COL] >= start_ts) & (pred[PRED_TS_COL] <= end_ts)].copy()
 
 # ---------------------------------------------------------------------
 # KPIs
 # ---------------------------------------------------------------------
 latest_actual = hist[HIST_PRICE_COL].dropna().iloc[-1] if hist[HIST_PRICE_COL].dropna().shape[0] else None
-latest_actual_ts = hist[TS_COL].iloc[-1] if len(hist) else None
-
-latest_pred = pred[PRED_COL].dropna().iloc[-1] if pred[PRED_COL].dropna().shape[0] else None
-latest_pred_ts = pred[TS_COL].iloc[-1] if len(pred) else None
-
+latest_actual_ts = hist[HIST_TS_COL].iloc[-1] if len(hist) else None
 first_pred = pred[PRED_COL].dropna().iloc[0] if pred[PRED_COL].dropna().shape[0] else None
 horizon_points = int(pred[PRED_COL].dropna().shape[0])
 
-delta_last = None
+delta_first = None
 if (latest_actual is not None) and (first_pred is not None):
-    delta_last = first_pred - latest_actual
+    delta_first = first_pred - latest_actual
 
 st.markdown("### 🔎 Summary")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Forecast horizon (points)", f"{horizon_points:,}")
 k2.metric("Latest actual", fmt(latest_actual, DECIMALS["price"], UNITS["price"]))
 k3.metric("First forecast value", fmt(first_pred, DECIMALS["price"], UNITS["price"]))
-k4.metric("Δ first forecast vs latest actual", fmt(delta_last, DECIMALS["price"], UNITS["price"]))
+k4.metric("Δ first forecast vs latest actual", fmt(delta_first, DECIMALS["price"], UNITS["price"]))
 
-if latest_actual_ts is not None and latest_pred_ts is not None:
-    st.caption(f"Latest actual timestamp: {latest_actual_ts} • Latest forecast timestamp: {latest_pred_ts}")
+if latest_actual_ts is not None:
+    st.caption(f"Latest actual timestamp: {latest_actual_ts} • Plot window: {start_ts} → {end_ts}")
 
 st.markdown("---")
 
 # ---------------------------------------------------------------------
-# Chart: history + forecast (+ optional uncertainty)
+# Chart: history (and MAs) + forecast (+ uncertainty)
 # ---------------------------------------------------------------------
-st.subheader("📈 Electricity price forecast")
+st.subheader("📈 Price vs prediction")
 st.caption(f"Unit: {UNITS['price']} • Timestamps shown in UTC")
 
 fig = go.Figure()
 
+# Historical (fixed color)
 fig.add_trace(
     go.Scatter(
-        x=hist_plot[TS_COL],
+        x=hist_plot[HIST_TS_COL],
         y=hist_plot[HIST_PRICE_COL],
         mode="lines",
         name=f"Historical ({UNITS['price']})",
+        line=dict(width=LINE_WIDTH, dash="solid", color=TRACE_COLORS["historical"]),
     )
 )
 
-fig.add_trace(
-    go.Scatter(
-        x=pred[TS_COL],
-        y=pred[PRED_COL],
-        mode="lines",
-        name=f"Forecast ({UNITS['price']})",
-        line=dict(dash="dash"),
+# Moving averages (fixed colors)
+if show_ma_30 and "ma_30d" in hist_plot.columns:
+    fig.add_trace(
+        go.Scatter(
+            x=hist_plot[HIST_TS_COL],
+            y=hist_plot["ma_30d"],
+            mode="lines",
+            name=f"30d avg ({UNITS['price']})",
+            line=dict(width=LINE_WIDTH, dash="solid", color=TRACE_COLORS["ma_30d"]),
+        )
     )
-)
 
-if has_uncertainty and show_uncertainty:
-    # build a filled polygon between upper and lower
-    x_poly = pred[TS_COL].tolist() + pred[TS_COL].tolist()[::-1]
-    y_poly = pred[UP_COL].tolist() + pred[LOW_COL].tolist()[::-1]
+if show_ma_182 and "ma_182d" in hist_plot.columns:
+    fig.add_trace(
+        go.Scatter(
+            x=hist_plot[HIST_TS_COL],
+            y=hist_plot["ma_182d"],
+            mode="lines",
+            name=f"6m avg ({UNITS['price']})",
+            line=dict(width=LINE_WIDTH, dash="solid", color=TRACE_COLORS["ma_182d"]),
+        )
+    )
 
+if show_ma_365 and "ma_365d" in hist_plot.columns:
+    fig.add_trace(
+        go.Scatter(
+            x=hist_plot[HIST_TS_COL],
+            y=hist_plot["ma_365d"],
+            mode="lines",
+            name=f"12m avg ({UNITS['price']})",
+            line=dict(width=LINE_WIDTH, dash="solid", color=TRACE_COLORS["ma_365d"]),
+        )
+    )
+
+# Forecast (fixed color)
+if not pred_plot.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=pred_plot[PRED_TS_COL],
+            y=pred_plot[PRED_COL],
+            mode="lines",
+            name=f"Forecast ({UNITS['price']})",
+            line=dict(width=LINE_WIDTH, dash="solid", color=TRACE_COLORS["forecast"]),
+        )
+    )
+
+# Uncertainty band (fixed fill + same forecast color for edge if needed)
+if has_uncertainty and show_uncertainty and (not pred_plot.empty):
+    x_poly = pred_plot[PRED_TS_COL].tolist() + pred_plot[PRED_TS_COL].tolist()[::-1]
+    y_poly = pred_plot[UP_COL].tolist() + pred_plot[LOW_COL].tolist()[::-1]
     fig.add_trace(
         go.Scatter(
             x=x_poly,
             y=y_poly,
             fill="toself",
+            fillcolor=TRACE_COLORS["band"],
             line=dict(width=0),
             name=f"Uncertainty band ({UNITS['price']})",
             showlegend=True,
@@ -249,36 +380,74 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------
-# Tables (with units in headers)
+# Feature importance bar chart (hard-coded)
 # ---------------------------------------------------------------------
-st.subheader("📋 Forecast table")
+st.markdown("---")
+st.subheader("📊 Model feature importance")
+st.caption("Hard-coded feature importances from the trained XGBoost model (from your importance plot).")
 
-table = pred.copy()
-
-# Round numeric columns (display-only)
-for c in table.columns:
-    if c != TS_COL and pd.api.types.is_numeric_dtype(table[c]):
-        table[c] = table[c].round(DECIMALS["price"])
-
-# Rename for display
-rename_map = {
-    TS_COL: "Timestamp (UTC)",
-    PRED_COL: f"Forecast ({UNITS['price']})",
-}
-if has_uncertainty:
-    rename_map[LOW_COL] = f"Lower ({UNITS['price']})"
-    rename_map[UP_COL] = f"Upper ({UNITS['price']})"
-
-table = table.rename(columns=rename_map)
-
-st.dataframe(table, use_container_width=True)
-
-st.subheader("📋 Latest historical rows (context window)")
-hist_table = hist_plot[[TS_COL, HIST_PRICE_COL]].tail(30).copy()
-hist_table = hist_table.rename(
-    columns={
-        TS_COL: "Timestamp (UTC)",
-        HIST_PRICE_COL: f"Actual ({UNITS['price']})",
-    }
+fi_df = pd.DataFrame({"feature": FI_FEATURES, "importance": FI_IMPORTANCES}).sort_values(
+    "importance", ascending=True
 )
-st.dataframe(hist_table, use_container_width=True)
+
+fig_fi = go.Figure()
+fig_fi.add_trace(
+    go.Bar(
+        x=fi_df["importance"],
+        y=fi_df["feature"],
+        orientation="h",
+        text=[f"{v:.1f}" for v in fi_df["importance"]],
+        textposition="outside",
+        cliponaxis=False,
+        name="Importance",
+    )
+)
+fig_fi.update_layout(
+    template="plotly_dark",
+    height=max(520, 18 * len(fi_df) + 120),
+    margin=dict(l=220, r=40, t=40, b=20),
+    xaxis_title="Importance score",
+    yaxis_title="",
+)
+
+st.plotly_chart(fig_fi, use_container_width=True)
+
+with st.expander("Show feature importance table"):
+    st.dataframe(fi_df.sort_values("importance", ascending=False), use_container_width=True)
+
+# ---------------------------------------------------------------------
+# Tables
+# ---------------------------------------------------------------------
+st.markdown("---")
+st.subheader("📋 Forecast table (filtered timeframe)")
+
+if pred_plot.empty:
+    st.info("No forecast rows in the selected timeframe.")
+else:
+    table_pred = pred_plot.copy()
+    for c in table_pred.columns:
+        if c != PRED_TS_COL and pd.api.types.is_numeric_dtype(table_pred[c]):
+            table_pred[c] = table_pred[c].round(DECIMALS["price"])
+
+    rename_map = {
+        PRED_TS_COL: "Timestamp (UTC)",
+        PRED_COL: f"Forecast ({UNITS['price']})",
+    }
+    if has_uncertainty:
+        rename_map[LOW_COL] = f"Lower ({UNITS['price']})"
+        rename_map[UP_COL] = f"Upper ({UNITS['price']})"
+
+    st.dataframe(table_pred.rename(columns=rename_map), use_container_width=True)
+
+st.subheader("📋 Latest historical rows (filtered timeframe)")
+if hist_plot.empty:
+    st.info("No historical rows in the selected timeframe.")
+else:
+    hist_table = hist_plot[[HIST_TS_COL, HIST_PRICE_COL]].tail(50).copy()
+    hist_table = hist_table.rename(
+        columns={
+            HIST_TS_COL: "Timestamp (UTC)",
+            HIST_PRICE_COL: f"Actual ({UNITS['price']})",
+        }
+    )
+    st.dataframe(hist_table, use_container_width=True)
